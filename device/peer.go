@@ -8,12 +8,16 @@ package device
 import (
 	"container/list"
 	"errors"
+	"math/rand"
+	"net"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/amnezia-vpn/amneziawg-go/conn"
 )
+
+const DNSRefreshInterval = 120 * time.Second
 
 type Peer struct {
 	isRunning         atomic.Bool
@@ -28,9 +32,12 @@ type Peer struct {
 	endpoint struct {
 		sync.Mutex
 		val            conn.Endpoint
-		clearSrcOnTx   bool // signal to val.ClearSrc() prior to next packet transmission
+		hostname       string // original host:port if set via hostname, empty for static IPs
+		clearSrcOnTx   bool   // signal to val.ClearSrc() prior to next packet transmission
 		disableRoaming bool
 	}
+
+	dnsStop chan struct{} // closed by Stop() to signal RoutineDNSRefresh to exit
 
 	timers struct {
 		retransmitHandshake     *Timer
@@ -189,7 +196,7 @@ func (peer *Peer) Start() {
 
 	// reset routine state
 	peer.stopping.Wait()
-	peer.stopping.Add(2)
+	peer.stopping.Add(3)
 
 	peer.handshake.mutex.Lock()
 	peer.handshake.lastSentHandshake = time.Now().Add(-(RekeyTimeout + time.Second))
@@ -202,11 +209,15 @@ func (peer *Peer) Start() {
 	device.flushInboundQueue(peer.queue.inbound)
 	device.flushOutboundQueue(peer.queue.outbound)
 
+	dnsStop := make(chan struct{})
+	peer.dnsStop = dnsStop
+
 	// Use the device batch size, not the bind batch size, as the device size is
 	// the size of the batch pools.
 	batchSize := peer.device.BatchSize()
 	go peer.RoutineSequentialSender(batchSize)
 	go peer.RoutineSequentialReceiver(batchSize)
+	go peer.RoutineDNSRefresh(dnsStop)
 
 	peer.isRunning.Store(true)
 }
@@ -270,6 +281,8 @@ func (peer *Peer) Stop() {
 	// Signal that RoutineSequentialSender and RoutineSequentialReceiver should exit.
 	peer.queue.inbound.c <- nil
 	peer.queue.outbound.c <- nil
+	// Signal RoutineDNSRefresh to exit.
+	close(peer.dnsStop)
 	peer.stopping.Wait()
 	peer.device.queue.encryption.wg.Done() // no more writes to encryption queue from us
 
@@ -293,4 +306,75 @@ func (peer *Peer) markEndpointSrcForClearing() {
 		return
 	}
 	peer.endpoint.clearSrcOnTx = true
+}
+
+// RoutineDNSRefresh periodically re-resolves the peer's hostname endpoint and
+// updates the active IP. When the hostname resolves to multiple addresses the
+// target IP is chosen at random on each tick, enabling rotation across a pool.
+func (peer *Peer) RoutineDNSRefresh(dnsStop <-chan struct{}) {
+	defer peer.stopping.Done()
+	device := peer.device
+	device.log.Verbosef("%v - Routine: DNS refresh - started", peer)
+	defer device.log.Verbosef("%v - Routine: DNS refresh - stopped", peer)
+
+	ticker := time.NewTicker(DNSRefreshInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-dnsStop:
+			return
+		case <-ticker.C:
+		}
+
+		peer.endpoint.Lock()
+		hostname := peer.endpoint.hostname
+		peer.endpoint.Unlock()
+
+		if hostname == "" {
+			continue
+		}
+
+		host, portStr, err := net.SplitHostPort(hostname)
+		if err != nil {
+			continue
+		}
+
+		addrs, err := net.LookupHost(host)
+		if err != nil || len(addrs) == 0 {
+			device.log.Errorf("%v - DNS refresh: failed to resolve %s: %v", peer, host, err)
+			continue
+		}
+
+		// Pick a random address so callers round-robin across the returned pool.
+		ip := addrs[rand.Intn(len(addrs))]
+		newAddrStr := net.JoinHostPort(ip, portStr)
+
+		device.net.RLock()
+		bind := device.net.bind
+		device.net.RUnlock()
+		if bind == nil {
+			continue
+		}
+
+		endpoint, err := bind.ParseEndpoint(newAddrStr)
+		if err != nil {
+			device.log.Errorf("%v - DNS refresh: invalid resolved endpoint %s: %v", peer, newAddrStr, err)
+			continue
+		}
+
+		peer.endpoint.Lock()
+		if peer.endpoint.hostname != "" {
+			oldStr := ""
+			if peer.endpoint.val != nil {
+				oldStr = peer.endpoint.val.DstToString()
+			}
+			if oldStr != endpoint.DstToString() {
+				device.log.Verbosef("%v - DNS refresh: endpoint updated %s -> %s", peer, oldStr, endpoint.DstToString())
+				peer.endpoint.val = endpoint
+				peer.endpoint.clearSrcOnTx = true
+			}
+		}
+		peer.endpoint.Unlock()
+	}
 }

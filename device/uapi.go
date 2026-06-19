@@ -557,12 +557,31 @@ func (device *Device) handlePeerLine(
 	case "endpoint":
 		device.log.Verbosef("%v - UAPI: Updating endpoint", peer.Peer)
 		endpoint, err := device.net.bind.ParseEndpoint(value)
+		hostname := ""
 		if err != nil {
-			return ipcErrorf(ipc.IpcErrorInvalid, "failed to set endpoint %v: %w", value, err)
+			// value may be a hostname:port rather than an IP:port — resolve it.
+			host, portStr, splitErr := net.SplitHostPort(value)
+			if splitErr != nil {
+				return ipcErrorf(ipc.IpcErrorInvalid, "failed to set endpoint %v: %w", value, err)
+			}
+			addrs, lookupErr := net.LookupHost(host)
+			if lookupErr != nil {
+				return ipcErrorf(ipc.IpcErrorInvalid, "failed to resolve endpoint %v: %w", value, lookupErr)
+			}
+			if len(addrs) == 0 {
+				return ipcErrorf(ipc.IpcErrorInvalid, "no addresses returned for endpoint %v", value)
+			}
+			resolved := net.JoinHostPort(addrs[0], portStr)
+			endpoint, err = device.net.bind.ParseEndpoint(resolved)
+			if err != nil {
+				return ipcErrorf(ipc.IpcErrorInvalid, "failed to set endpoint %v: %w", value, err)
+			}
+			hostname = value
 		}
 		peer.endpoint.Lock()
 		defer peer.endpoint.Unlock()
 		peer.endpoint.val = endpoint
+		peer.endpoint.hostname = hostname
 
 	case "persistent_keepalive_interval":
 		device.log.Verbosef("%v - UAPI: Updating persistent keepalive interval", peer.Peer)
