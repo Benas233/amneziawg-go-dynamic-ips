@@ -84,7 +84,6 @@ func (device *Device) IpcGetOperation(w io.Writer) error {
 		defer device.peers.RUnlock()
 
 		// serialize device related values
-
 		if !device.staticIdentity.privateKey.IsZero() {
 			keyf("private_key", (*[32]byte)(&device.staticIdentity.privateKey))
 		}
@@ -175,6 +174,23 @@ func (device *Device) IpcGetOperation(w io.Writer) error {
 				return true
 			})
 		}
+
+		if device.portHopping.interval > 0 {
+			sendf("port_hop_interval=%d", device.portHopping.interval)
+		}
+
+		if device.portHopping.portRange[0] != 0 || device.portHopping.portRange[1] != 0 {
+			sendf("port_hop_range=%d-%d", device.portHopping.portRange[0], device.portHopping.portRange[1])
+		}
+
+		if len(device.portHopping.excludedPorts) > 0 {
+			excludedPorts := make([]string, 0, len(device.portHopping.excludedPorts))
+			for _, port := range device.portHopping.excludedPorts {
+				excludedPorts = append(excludedPorts, strconv.Itoa(int(port)))
+			}
+			sendf("port_hop_excluded=%s", strings.Join(excludedPorts, ","))
+		}
+
 	}()
 
 	// send lines (does not require resource locks)
@@ -446,6 +462,29 @@ func (device *Device) handleDeviceLine(key, value string) error {
 			return ipcErrorf(ipc.IpcErrorInvalid, "failed to parse I5: %w", err)
 		}
 		device.ipackets[4] = chain
+	case "port_hop_range":
+		parts := strings.Split(value, "-")
+		if len(parts) == 2 {
+			minPort, err1 := strconv.ParseUint(strings.TrimSpace(parts[0]), 10, 16)
+			maxPort, err2 := strconv.ParseUint(strings.TrimSpace(parts[1]), 10, 16)
+			if err1 == nil && err2 == nil {
+				device.portHopping.portRange = [2]uint16{uint16(minPort), uint16(maxPort)}
+			}
+		}
+	case "port_hop_excluded":
+		portsStr := strings.Split(value, ",")
+		var excluded []uint16
+		for _, pStr := range portsStr {
+			if p, err := strconv.ParseUint(strings.TrimSpace(pStr), 10, 16); err == nil {
+				excluded = append(excluded, uint16(p))
+			}
+		}
+		device.portHopping.excludedPorts = excluded
+	case "port_hop_interval":
+		interval, err := strconv.ParseUint(value, 10, 64)
+		if err == nil {
+			device.portHopping.interval = uint64(interval)
+		}
 
 	default:
 		return ipcErrorf(ipc.IpcErrorInvalid, "invalid UAPI device key: %v", key)
