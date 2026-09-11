@@ -89,10 +89,9 @@ func (device *Device) NewPeer(pk NoisePublicKey) (*Peer, error) {
 		if minPort > maxPort {
 			return nil, errors.New("port hopping range set incorrectly: min port cannot be greater than max port")
 		}
-	}
-
-	if device.portHopping.interval <= 0 {
-		return nil, errors.New("invalid port hopping config: port hopping interval must be greater than 0")
+		if device.portHopping.interval <= 0 {
+			return nil, errors.New("invalid port hopping config: port hopping interval must be greater than 0")
+		}
 	}
 
 	if len(device.portHopping.excludedPorts) > 0 {
