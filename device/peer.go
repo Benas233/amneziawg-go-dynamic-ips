@@ -68,6 +68,15 @@ type Peer struct {
 	persistentKeepaliveInterval atomic.Uint32
 }
 
+// portHoppingEnabled reports whether port hopping is fully configured.
+// Missing params (zero range or zero interval) disable hopping instead of
+// causing a divide-by-zero or a non-positive ticker interval panic.
+func (device *Device) portHoppingEnabled() bool {
+	minPort := device.portHopping.portRange[0]
+	maxPort := device.portHopping.portRange[1]
+	return minPort > 0 && maxPort > 0 && minPort <= maxPort && device.portHopping.interval > 0
+}
+
 func (device *Device) NewPeer(pk NoisePublicKey) (*Peer, error) {
 	if device.isClosed() {
 		return nil, errors.New("device closed")
@@ -247,11 +256,13 @@ func (peer *Peer) Start() {
 	go peer.RoutineSequentialSender(batchSize)
 	go peer.RoutineSequentialReceiver(batchSize)
 
-	peer.endpoint.Lock()
-	peer.endpoint.disableRoaming = true
-	peer.endpoint.Unlock()
+	if device.portHoppingEnabled() {
+		peer.endpoint.Lock()
+		peer.endpoint.disableRoaming = true
+		peer.endpoint.Unlock()
 
-	peer.doSingleHop()
+		peer.doSingleHop()
+	}
 
 	peer.timersStart()
 
@@ -263,6 +274,10 @@ func (peer *Peer) Start() {
 // doSingleHop calculates the current target port, updates memory, and resets handshake state.
 func (peer *Peer) doSingleHop() bool {
 	device := peer.device
+
+	if !device.portHoppingEnabled() {
+		return true
+	}
 
 	peer.endpoint.Lock()
 	if peer.endpoint.val == nil {
@@ -325,6 +340,10 @@ func (peer *Peer) doSingleHop() bool {
 
 func (peer *Peer) PortHopRoutine(portHopStop <-chan struct{}) {
 	defer peer.stopping.Done()
+
+	if !peer.device.portHoppingEnabled() {
+		return
+	}
 
 	ticker := time.NewTicker(time.Duration(peer.device.portHopping.interval) * time.Second)
 	defer ticker.Stop()
@@ -481,6 +500,10 @@ func GeneratePortFromSequence(secretKey []byte, sequence uint64, portMin, portMa
 func (peer *Peer) PortHop(portHopStop <-chan struct{}) {
 	defer peer.stopping.Done()
 	device := peer.device
+
+	if !device.portHoppingEnabled() {
+		return
+	}
 
 	ticker := time.NewTicker(time.Duration(peer.device.portHopping.interval) * time.Second)
 	defer ticker.Stop()
