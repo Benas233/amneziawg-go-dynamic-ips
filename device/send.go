@@ -118,6 +118,8 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 	peer.handshake.lastSentHandshake = time.Now()
 	peer.handshake.mutex.Unlock()
 
+	peer.hopPortForHandshake()
+
 	peer.device.log.Verbosef("%v - Sending handshake initiation", peer)
 
 	msg, err := peer.device.CreateMessageInitiation(peer)

@@ -31,7 +31,6 @@ type Peer struct {
 	txBytes           atomic.Uint64  // bytes send to peer (endpoint)
 	rxBytes           atomic.Uint64  // bytes received from peer
 	lastHandshakeNano atomic.Int64   // nano seconds since epoch
-	portHopSequence   atomic.Uint64
 	endpoint          struct {
 		sync.Mutex
 		val            conn.Endpoint
@@ -39,8 +38,6 @@ type Peer struct {
 		clearSrcOnTx   bool   // signal to val.ClearSrc() prior to next packet transmission
 		disableRoaming bool
 	}
-
-	portHopStop chan struct{}
 
 	timers struct {
 		retransmitHandshake     *Timer
@@ -238,7 +235,7 @@ func (peer *Peer) Start() {
 	device.log.Verbosef("%v - Starting", peer)
 
 	peer.stopping.Wait()
-	peer.stopping.Add(3)
+	peer.stopping.Add(2)
 
 	peer.handshake.mutex.Lock()
 	peer.handshake.lastSentHandshake = time.Now().Add(-(RekeyTimeout + time.Second))
@@ -249,9 +246,6 @@ func (peer *Peer) Start() {
 	device.flushInboundQueue(peer.queue.inbound)
 	device.flushOutboundQueue(peer.queue.outbound)
 
-	portHopStop := make(chan struct{})
-	peer.portHopStop = portHopStop
-
 	batchSize := peer.device.BatchSize()
 	go peer.RoutineSequentialSender(batchSize)
 	go peer.RoutineSequentialReceiver(batchSize)
@@ -260,67 +254,61 @@ func (peer *Peer) Start() {
 		peer.endpoint.Lock()
 		peer.endpoint.disableRoaming = true
 		peer.endpoint.Unlock()
-
-		peer.doSingleHop()
 	}
 
 	peer.timersStart()
 
-	go peer.PortHopRoutine(portHopStop)
-
 	peer.isRunning.Store(true)
 }
 
-// doSingleHop calculates the current target port, updates memory, and resets handshake state.
-func (peer *Peer) doSingleHop() bool {
+// hopPortForHandshake points the peer endpoint at the port for the current
+// time slot. It is called right before each handshake initiation, so the port
+// only ever changes on a handshake.
+func (peer *Peer) hopPortForHandshake() {
 	device := peer.device
 
-	if !device.portHoppingEnabled() {
-		return true
+	if !device.portHoppingEnabled() || device.isClosed() {
+		return
 	}
 
 	peer.endpoint.Lock()
 	if peer.endpoint.val == nil {
 		peer.endpoint.Unlock()
-		return true
+		return
 	}
 	currentEndpointStr := peer.endpoint.val.DstToString()
 	peer.endpoint.Unlock()
 
-	host, _, err := net.SplitHostPort(currentEndpointStr)
+	host, currentPort, err := net.SplitHostPort(currentEndpointStr)
 	if err != nil {
 		log.Printf("[PortHop] Failed to parse endpoint host: %v", err)
-		return true
+		return
 	}
 
-	currentTime := time.Now().Unix()
-	timeStep := device.portHopping.interval
-	nextSeq := uint64(currentTime) / timeStep
+	seq := uint64(time.Now().Unix()) / device.portHopping.interval
 
 	pubKeyBase64 := base64.StdEncoding.EncodeToString(peer.handshake.remoteStatic[:])
-	pubKeyBase64Bytes := []byte(pubKeyBase64)
 	portMin := device.portHopping.portRange[0]
 	portMax := device.portHopping.portRange[1]
 
-	newPort := GeneratePortFromSequence(pubKeyBase64Bytes, nextSeq, portMin, portMax, device.portHopping.excludedPorts)
-	newEndpointStr := fmt.Sprintf("%s:%d", host, newPort)
-
-	if device.isClosed() {
-		return false
+	newPort := GeneratePortFromSequence([]byte(pubKeyBase64), seq, portMin, portMax, device.portHopping.excludedPorts)
+	if currentPort == fmt.Sprint(newPort) {
+		return
 	}
+	newEndpointStr := net.JoinHostPort(host, fmt.Sprint(newPort))
 
 	device.net.RLock()
 	bind := device.net.bind
 	device.net.RUnlock()
 
 	if bind == nil {
-		return true
+		return
 	}
 
 	endpoint, err := bind.ParseEndpoint(newEndpointStr)
 	if err != nil {
 		log.Printf("[PortHop] ParseEndpoint error for %s: %v", newEndpointStr, err)
-		return true
+		return
 	}
 
 	peer.endpoint.Lock()
@@ -329,45 +317,7 @@ func (peer *Peer) doSingleHop() bool {
 	peer.endpoint.clearSrcOnTx = true
 	peer.endpoint.Unlock()
 
-	peer.FlushStagedPackets()
-
-	peer.handshake.mutex.Lock()
-	peer.handshake.lastSentHandshake = time.Now().Add(-(RekeyTimeout + time.Second))
-	peer.handshake.mutex.Unlock()
-
-	return true
-}
-
-func (peer *Peer) PortHopRoutine(portHopStop <-chan struct{}) {
-	defer peer.stopping.Done()
-
-	if !peer.device.portHoppingEnabled() {
-		return
-	}
-
-	ticker := time.NewTicker(time.Duration(peer.device.portHopping.interval) * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-portHopStop:
-			return
-		case <-ticker.C:
-			select {
-			case <-portHopStop:
-				return
-			default:
-			}
-
-			if !peer.doSingleHop() {
-				return
-			}
-
-			if peer.isRunning.Load() {
-				peer.SendHandshakeInitiation(true)
-			}
-		}
-	}
+	device.log.Verbosef("%v - Port hop to %s", peer, newEndpointStr)
 }
 
 func (peer *Peer) ZeroAndFlushAll() {
@@ -428,7 +378,6 @@ func (peer *Peer) Stop() {
 	peer.timersStop()
 	peer.queue.inbound.c <- nil
 	peer.queue.outbound.c <- nil
-	close(peer.portHopStop)
 	peer.stopping.Wait()
 	peer.device.queue.encryption.wg.Done() // no more writes to encryption queue from us
 
@@ -495,92 +444,4 @@ func GeneratePortFromSequence(secretKey []byte, sequence uint64, portMin, portMa
 	}
 
 	return portMin
-}
-
-func (peer *Peer) PortHop(portHopStop <-chan struct{}) {
-	defer peer.stopping.Done()
-	device := peer.device
-
-	if !device.portHoppingEnabled() {
-		return
-	}
-
-	ticker := time.NewTicker(time.Duration(peer.device.portHopping.interval) * time.Second)
-	defer ticker.Stop()
-
-	pubKeyBase64 := base64.StdEncoding.EncodeToString(peer.handshake.remoteStatic[:])
-	pubKeyBase64Bytes := []byte(pubKeyBase64)
-	portMin := device.portHopping.portRange[0]
-	portMax := device.portHopping.portRange[1]
-
-	peer.endpoint.Lock()
-	peer.endpoint.disableRoaming = true
-	peer.endpoint.Unlock()
-
-	doHop := func() bool {
-		select {
-		case <-portHopStop:
-			return false
-		default:
-		}
-
-		peer.endpoint.Lock()
-		if peer.endpoint.val == nil {
-			peer.endpoint.Unlock()
-			return true
-		}
-		currentEndpointStr := peer.endpoint.val.DstToString()
-		peer.endpoint.Unlock()
-
-		host, _, err := net.SplitHostPort(currentEndpointStr)
-		if err != nil {
-			log.Printf("[PortHop] Failed to parse endpoint host: %v", err)
-			return true
-		}
-
-		currentTime := time.Now().Unix()
-		timeStep := int64(300)
-		nextSeq := uint64(currentTime / timeStep)
-
-		newPort := GeneratePortFromSequence(pubKeyBase64Bytes, nextSeq, portMin, portMax, device.portHopping.excludedPorts)
-		newEndpointStr := fmt.Sprintf("%s:%d", host, newPort)
-
-		if device.isClosed() {
-			return false
-		}
-
-		device.net.RLock()
-		bind := device.net.bind
-		device.net.RUnlock()
-
-		if bind == nil {
-			return true
-		}
-		endpoint, err := bind.ParseEndpoint(newEndpointStr)
-		if err != nil {
-			log.Printf("[PortHop] ParseEndpoint error for %s: %v", newEndpointStr, err)
-			return true
-		}
-
-		peer.endpoint.Lock()
-		peer.endpoint.val = endpoint
-		peer.endpoint.hostname = newEndpointStr
-		peer.endpoint.Unlock()
-		return true
-	}
-
-	if !doHop() {
-		return
-	}
-
-	for {
-		select {
-		case <-portHopStop:
-			return
-		case <-ticker.C:
-			if !doHop() {
-				return
-			}
-		}
-	}
 }
