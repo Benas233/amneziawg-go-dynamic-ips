@@ -175,17 +175,19 @@ func (device *Device) IpcGetOperation(w io.Writer) error {
 			})
 		}
 
-		if device.portHopping.interval > 0 {
-			sendf("port_hop_interval=%d", device.portHopping.interval)
+		hop := device.portHopSettings()
+
+		if hop.interval > 0 {
+			sendf("port_hop_interval=%d", hop.interval)
 		}
 
-		if device.portHopping.portRange[0] != 0 || device.portHopping.portRange[1] != 0 {
-			sendf("port_hop_range=%d-%d", device.portHopping.portRange[0], device.portHopping.portRange[1])
+		if hop.portRange[0] != 0 || hop.portRange[1] != 0 {
+			sendf("port_hop_range=%d-%d", hop.portRange[0], hop.portRange[1])
 		}
 
-		if len(device.portHopping.excludedPorts) > 0 {
-			excludedPorts := make([]string, 0, len(device.portHopping.excludedPorts))
-			for _, port := range device.portHopping.excludedPorts {
+		if len(hop.excludedPorts) > 0 {
+			excludedPorts := make([]string, 0, len(hop.excludedPorts))
+			for _, port := range hop.excludedPorts {
 				excludedPorts = append(excludedPorts, strconv.Itoa(int(port)))
 			}
 			sendf("port_hop_excluded=%s", strings.Join(excludedPorts, ","))
@@ -468,7 +470,9 @@ func (device *Device) handleDeviceLine(key, value string) error {
 			minPort, err1 := strconv.ParseUint(strings.TrimSpace(parts[0]), 10, 16)
 			maxPort, err2 := strconv.ParseUint(strings.TrimSpace(parts[1]), 10, 16)
 			if err1 == nil && err2 == nil {
-				device.portHopping.portRange = [2]uint16{uint16(minPort), uint16(maxPort)}
+				device.updatePortHopping(func(c *portHopConfig) {
+					c.portRange = [2]uint16{uint16(minPort), uint16(maxPort)}
+				})
 			}
 		}
 	case "port_hop_excluded":
@@ -479,11 +483,15 @@ func (device *Device) handleDeviceLine(key, value string) error {
 				excluded = append(excluded, uint16(p))
 			}
 		}
-		device.portHopping.excludedPorts = excluded
+		device.updatePortHopping(func(c *portHopConfig) {
+			c.excludedPorts = excluded
+		})
 	case "port_hop_interval":
 		interval, err := strconv.ParseUint(value, 10, 64)
 		if err == nil {
-			device.portHopping.interval = uint64(interval)
+			device.updatePortHopping(func(c *portHopConfig) {
+				c.interval = interval
+			})
 		}
 
 	default:
@@ -617,10 +625,18 @@ func (device *Device) handlePeerLine(
 			}
 			hostname = value
 		}
+		// Store the endpoint already on the current slot's port, so the
+		// configured base port is never used for sending.
+		if cfg := device.portHopping.Load(); cfg.enabled() {
+			if hopped, changed, err := peer.hopEndpoint(device.net.bind, endpoint, cfg, cfg.slot()); err == nil && changed {
+				endpoint = hopped
+			}
+		}
 		peer.endpoint.Lock()
 		defer peer.endpoint.Unlock()
 		peer.endpoint.val = endpoint
 		peer.endpoint.hostname = hostname
+		peer.hopDone.Store(nil) // re-check the port hopping slot on the next send
 
 	case "persistent_keepalive_interval":
 		device.log.Verbosef("%v - UAPI: Updating persistent keepalive interval", peer.Peer)

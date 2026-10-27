@@ -110,11 +110,7 @@ type Device struct {
 		transport int
 	}
 
-	portHopping struct {
-		portRange     [2]uint16
-		excludedPorts []uint16
-		interval      uint64
-	}
+	portHopping atomic.Pointer[portHopConfig] // replaced as a whole, never modified in place
 
 	ipackets [5]*obfChain
 }

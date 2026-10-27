@@ -12,9 +12,8 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
-	"fmt"
-	"log"
 	"net"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -38,6 +37,8 @@ type Peer struct {
 		clearSrcOnTx   bool   // signal to val.ClearSrc() prior to next packet transmission
 		disableRoaming bool
 	}
+
+	hopDone atomic.Pointer[hopMark] // port hopping config and slot the endpoint was last moved for
 
 	timers struct {
 		retransmitHandshake     *Timer
@@ -65,13 +66,48 @@ type Peer struct {
 	persistentKeepaliveInterval atomic.Uint32
 }
 
-// portHoppingEnabled reports whether port hopping is fully configured.
-// Missing params (zero range or zero interval) disable hopping instead of
-// causing a divide-by-zero or a non-positive ticker interval panic.
-func (device *Device) portHoppingEnabled() bool {
-	minPort := device.portHopping.portRange[0]
-	maxPort := device.portHopping.portRange[1]
-	return minPort > 0 && maxPort > 0 && minPort <= maxPort && device.portHopping.interval > 0
+// portHopConfig holds the port hopping settings. A published config is never
+// modified; UAPI replaces it as a whole, so senders always see one consistent
+// snapshot even while the settings change.
+type portHopConfig struct {
+	portRange     [2]uint16
+	excludedPorts []uint16
+	interval      uint64
+}
+
+// enabled reports whether port hopping is fully configured. Missing params
+// (zero range or zero interval) disable hopping instead of causing a
+// divide-by-zero.
+func (c *portHopConfig) enabled() bool {
+	return c != nil && c.portRange[0] > 0 && c.portRange[1] > 0 && c.portRange[0] <= c.portRange[1] && c.interval > 0
+}
+
+// slot returns the current time slot. Only valid if c is enabled.
+func (c *portHopConfig) slot() uint64 {
+	return uint64(time.Now().Unix()) / c.interval
+}
+
+// portHopSettings returns a copy of the current port hopping settings.
+func (device *Device) portHopSettings() portHopConfig {
+	if c := device.portHopping.Load(); c != nil {
+		return *c
+	}
+	return portHopConfig{}
+}
+
+// updatePortHopping publishes a modified copy of the port hopping settings.
+// The new config invalidates every peer's hopMark, so each peer re-hops on its
+// next send. UAPI calls are serialized, so the copy cannot lose an update.
+func (device *Device) updatePortHopping(modify func(*portHopConfig)) {
+	c := device.portHopSettings()
+	modify(&c)
+	device.portHopping.Store(&c)
+}
+
+// hopMark records the config and slot a peer's endpoint port was last set for.
+type hopMark struct {
+	cfg  *portHopConfig
+	slot uint64
 }
 
 func (device *Device) NewPeer(pk NoisePublicKey) (*Peer, error) {
@@ -85,8 +121,9 @@ func (device *Device) NewPeer(pk NoisePublicKey) (*Peer, error) {
 	device.peers.Lock()
 	defer device.peers.Unlock()
 
-	minPort := device.portHopping.portRange[0]
-	maxPort := device.portHopping.portRange[1]
+	hop := device.portHopSettings()
+	minPort := hop.portRange[0]
+	maxPort := hop.portRange[1]
 
 	if minPort > 0 || maxPort > 0 {
 		if minPort == 0 || maxPort == 0 {
@@ -95,18 +132,18 @@ func (device *Device) NewPeer(pk NoisePublicKey) (*Peer, error) {
 		if minPort > maxPort {
 			return nil, errors.New("port hopping range set incorrectly: min port cannot be greater than max port")
 		}
-		if device.portHopping.interval <= 0 {
+		if hop.interval <= 0 {
 			return nil, errors.New("invalid port hopping config: port hopping interval must be greater than 0")
 		}
 	}
 
-	if len(device.portHopping.excludedPorts) > 0 {
+	if len(hop.excludedPorts) > 0 {
 		if minPort == 0 || maxPort == 0 {
 			return nil, errors.New("invalid port hopping config: excluded ports provided without a valid port range")
 		}
 
-		excludedMap := make(map[uint16]bool, len(device.portHopping.excludedPorts))
-		for _, port := range device.portHopping.excludedPorts {
+		excludedMap := make(map[uint16]bool, len(hop.excludedPorts))
+		for _, port := range hop.excludedPorts {
 			excludedMap[port] = true
 		}
 
@@ -171,6 +208,9 @@ func (device *Device) NewPeer(pk NoisePublicKey) (*Peer, error) {
 }
 
 func (peer *Peer) SendBuffers(buffers [][]byte) error {
+	// Must run before taking device.net below, as hopping takes it too.
+	peer.hopToCurrentSlot(false)
+
 	peer.device.net.RLock()
 	defer peer.device.net.RUnlock()
 
@@ -250,7 +290,7 @@ func (peer *Peer) Start() {
 	go peer.RoutineSequentialSender(batchSize)
 	go peer.RoutineSequentialReceiver(batchSize)
 
-	if device.portHoppingEnabled() {
+	if device.portHopping.Load().enabled() {
 		peer.endpoint.Lock()
 		peer.endpoint.disableRoaming = true
 		peer.endpoint.Unlock()
@@ -261,63 +301,78 @@ func (peer *Peer) Start() {
 	peer.isRunning.Store(true)
 }
 
-// hopPortForHandshake points the peer endpoint at the port for the current
-// time slot. It is called right before each handshake initiation, so the port
-// only ever changes on a handshake.
-func (peer *Peer) hopPortForHandshake() {
+// hopToCurrentSlot points the peer endpoint at the port for the current time
+// slot. It runs before every send, but only does work when the config or slot
+// changed since the endpoint was last moved, or when force is set (before each
+// handshake initiation, as a final check).
+func (peer *Peer) hopToCurrentSlot(force bool) {
+	cfg := peer.device.portHopping.Load()
+	if !cfg.enabled() {
+		return
+	}
+
+	slot := cfg.slot()
+	if m := peer.hopDone.Load(); !force && m != nil && m.cfg == cfg && m.slot == slot {
+		return
+	}
+
+	peer.hopPort(cfg, slot)
+}
+
+// hopPort points the peer endpoint at the port for the given config and slot.
+// The endpoint is read and replaced under one lock, so a concurrent UAPI
+// endpoint change is never overwritten with the old address, and hopDone is
+// only set once the endpoint really is on that port.
+func (peer *Peer) hopPort(cfg *portHopConfig, slot uint64) {
 	device := peer.device
 
-	if !device.portHoppingEnabled() || device.isClosed() {
-		return
-	}
-
-	peer.endpoint.Lock()
-	if peer.endpoint.val == nil {
-		peer.endpoint.Unlock()
-		return
-	}
-	currentEndpointStr := peer.endpoint.val.DstToString()
-	peer.endpoint.Unlock()
-
-	host, currentPort, err := net.SplitHostPort(currentEndpointStr)
-	if err != nil {
-		log.Printf("[PortHop] Failed to parse endpoint host: %v", err)
-		return
-	}
-
-	seq := uint64(time.Now().Unix()) / device.portHopping.interval
-
-	pubKeyBase64 := base64.StdEncoding.EncodeToString(peer.handshake.remoteStatic[:])
-	portMin := device.portHopping.portRange[0]
-	portMax := device.portHopping.portRange[1]
-
-	newPort := GeneratePortFromSequence([]byte(pubKeyBase64), seq, portMin, portMax, device.portHopping.excludedPorts)
-	if currentPort == fmt.Sprint(newPort) {
-		return
-	}
-	newEndpointStr := net.JoinHostPort(host, fmt.Sprint(newPort))
-
+	// Same lock order as SendBuffers: device.net, then endpoint.
 	device.net.RLock()
-	bind := device.net.bind
-	device.net.RUnlock()
+	defer device.net.RUnlock()
 
-	if bind == nil {
-		return
-	}
-
-	endpoint, err := bind.ParseEndpoint(newEndpointStr)
-	if err != nil {
-		log.Printf("[PortHop] ParseEndpoint error for %s: %v", newEndpointStr, err)
-		return
+	if device.isClosed() || device.net.bind == nil {
+		return // not marked done, so the next send retries
 	}
 
 	peer.endpoint.Lock()
-	peer.endpoint.val = endpoint
-	peer.endpoint.hostname = newEndpointStr
-	peer.endpoint.clearSrcOnTx = true
-	peer.endpoint.Unlock()
+	defer peer.endpoint.Unlock()
 
-	device.log.Verbosef("%v - Port hop to %s", peer, newEndpointStr)
+	if ep := peer.endpoint.val; ep != nil {
+		hopped, changed, err := peer.hopEndpoint(device.net.bind, ep, cfg, slot)
+		switch {
+		case err != nil:
+			device.log.Errorf("%v - Port hop failed for %s: %v", peer, ep.DstToString(), err)
+		case changed:
+			peer.endpoint.val = hopped
+			peer.endpoint.clearSrcOnTx = true
+			device.log.Verbosef("%v - Port hop to %s", peer, hopped.DstToString())
+		}
+	}
+
+	// Marked even on error: retrying within the same slot would fail the same way.
+	peer.hopDone.Store(&hopMark{cfg: cfg, slot: slot})
+}
+
+// hopEndpoint returns ep moved to the port for the given config and slot, and
+// whether that differs from ep.
+func (peer *Peer) hopEndpoint(bind conn.Bind, ep conn.Endpoint, cfg *portHopConfig, slot uint64) (conn.Endpoint, bool, error) {
+	pubKeyBase64 := base64.StdEncoding.EncodeToString(peer.handshake.remoteStatic[:])
+	port := GeneratePortFromSequence([]byte(pubKeyBase64), slot, cfg.portRange[0], cfg.portRange[1], cfg.excludedPorts)
+	newPort := strconv.Itoa(int(port))
+
+	host, currentPort, err := net.SplitHostPort(ep.DstToString())
+	if err != nil {
+		return nil, false, err
+	}
+	if currentPort == newPort {
+		return ep, false, nil
+	}
+
+	hopped, err := bind.ParseEndpoint(net.JoinHostPort(host, newPort))
+	if err != nil {
+		return nil, false, err
+	}
+	return hopped, true, nil
 }
 
 func (peer *Peer) ZeroAndFlushAll() {
@@ -408,20 +463,20 @@ func GeneratePortFromSequence(secretKey []byte, sequence uint64, portMin, portMa
 		return portMin
 	}
 
+	totalRange := uint32(portMax) - uint32(portMin) + 1
+
+	// Count the distinct excluded ports inside the range, instead of walking
+	// the whole range, so a hop stays cheap on the send path.
 	excludedMap := make(map[uint16]bool, len(excluded))
+	var excludedInRange uint32
 	for _, p := range excluded {
+		if !excludedMap[p] && p >= portMin && p <= portMax {
+			excludedInRange++
+		}
 		excludedMap[p] = true
 	}
 
-	totalRange := uint32(portMax) - uint32(portMin) + 1
-	var availablePorts uint32
-	for p := uint32(portMin); p <= uint32(portMax); p++ {
-		if !excludedMap[uint16(p)] {
-			availablePorts++
-		}
-	}
-
-	if availablePorts == 0 {
+	if excludedInRange >= totalRange {
 		return portMin
 	}
 

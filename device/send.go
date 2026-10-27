@@ -104,21 +104,21 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 	}
 
 	peer.handshake.mutex.RLock()
-	if time.Since(peer.handshake.lastSentHandshake) < RekeyTimeout {
+	if realSince(peer.handshake.lastSentHandshake) < RekeyTimeout {
 		peer.handshake.mutex.RUnlock()
 		return nil
 	}
 	peer.handshake.mutex.RUnlock()
 
 	peer.handshake.mutex.Lock()
-	if time.Since(peer.handshake.lastSentHandshake) < RekeyTimeout {
+	if realSince(peer.handshake.lastSentHandshake) < RekeyTimeout {
 		peer.handshake.mutex.Unlock()
 		return nil
 	}
 	peer.handshake.lastSentHandshake = time.Now()
 	peer.handshake.mutex.Unlock()
 
-	peer.hopPortForHandshake()
+	peer.hopToCurrentSlot(true)
 
 	peer.device.log.Verbosef("%v - Sending handshake initiation", peer)
 
@@ -263,7 +263,11 @@ func (peer *Peer) keepKeyFreshSending() {
 		return
 	}
 	nonce := keypair.sendNonce.Load()
-	if nonce > RekeyAfterMessages || (keypair.isInitiator && time.Since(keypair.created) > RekeyAfterTime) {
+	age := realSince(keypair.created)
+	// The last condition only fires after a suspend (or a forward clock step):
+	// the peer has likely expired these keys, so handshake now, whichever side
+	// started the session. The keys are still used meanwhile, in case they work.
+	if nonce > RekeyAfterMessages || (keypair.isInitiator && age > RekeyAfterTime) || age >= RejectAfterTime {
 		peer.SendHandshakeInitiation(false)
 	}
 }
