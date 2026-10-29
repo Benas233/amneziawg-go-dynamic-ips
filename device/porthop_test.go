@@ -78,10 +78,45 @@ func setPeerEndpoint(t *testing.T, p *Peer, s string) {
 	p.endpoint.Unlock()
 }
 
-func currentHopEndpoint(p *Peer) string {
+func currentHopPort(p *Peer) uint16 {
 	key := []byte(base64.StdEncoding.EncodeToString(p.handshake.remoteStatic[:]))
 	seq := uint64(time.Now().Unix()) / testHopInterval
-	return fmt.Sprintf("127.0.0.1:%d", GeneratePortFromSequence(key, seq, testHopMin, testHopMax, nil))
+	return GeneratePortFromSequence(key, seq, testHopMin, testHopMax, nil)
+}
+
+func currentHopEndpoint(p *Peer) string {
+	return fmt.Sprintf("127.0.0.1:%d", currentHopPort(p))
+}
+
+// newRealBindPortHopPeer is newPortHopPeer with hopping on, but on the real
+// bind, for tests that need the endpoint host, which bindtest endpoints drop.
+func newRealBindPortHopPeer(t *testing.T) *Peer {
+	t.Helper()
+	priv, _ := newPrivateKey()
+	peerPriv, _ := newPrivateKey()
+	peerPub := peerPriv.publicKey()
+	dev := NewDevice(tuntest.NewChannelTUN().TUN(), conn.NewDefaultBind(), NewLogger(LogLevelError, ""))
+	t.Cleanup(dev.Close)
+	if err := dev.Up(); err != nil {
+		t.Fatal(err)
+	}
+	cfg := append([]string{"private_key", hex.EncodeToString(priv[:]), "listen_port", "0"}, portHopCfg()...)
+	cfg = append(cfg, "public_key", hex.EncodeToString(peerPub[:]), "endpoint", testStaticEP)
+	if err := dev.IpcSet(uapiCfg(cfg...)); err != nil {
+		t.Fatal(err)
+	}
+	return dev.LookupPeer(peerPub)
+}
+
+// roamFrom feeds the peer an authenticated packet from addr, as receive does.
+func roamFrom(t *testing.T, p *Peer, addr string) conn.Endpoint {
+	t.Helper()
+	ep, err := p.device.net.bind.ParseEndpoint(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.SetEndpointFromPacket(ep)
+	return ep
 }
 
 func TestPortHopDisabledKeepsEndpoint(t *testing.T) {
@@ -155,6 +190,84 @@ func TestPortHopConfigChangeRehops(t *testing.T) {
 	want := fmt.Sprintf("127.0.0.1:%d", GeneratePortFromSequence(key, seq, 50000, 50999, nil))
 	if got := peerEndpoint(p); got != want {
 		t.Fatalf("endpoint after range change + send = %s, want %s", got, want)
+	}
+}
+
+// A late packet from the old port must not pull the endpoint back to it.
+func TestPortHopRoamingSameHostKeepsPort(t *testing.T) {
+	p := newPortHopPeer(t, portHopCfg()...)
+	p.SendBuffers([][]byte{{0}})
+
+	roamFrom(t, p, testStaticEP)
+	if got, want := peerEndpoint(p), currentHopEndpoint(p); got != want {
+		t.Fatalf("endpoint after packet from old port = %s, want %s", got, want)
+	}
+	p.SendBuffers([][]byte{{0}})
+	if got, want := peerEndpoint(p), currentHopEndpoint(p); got != want {
+		t.Fatalf("endpoint after packet from old port + send = %s, want %s", got, want)
+	}
+}
+
+// Same, with hopping turned on while the peer is already running.
+func TestPortHopRoamingAfterRuntimeEnable(t *testing.T) {
+	p := newPortHopPeer(t)
+	if err := p.device.IpcSet(uapiCfg(portHopCfg()...)); err != nil {
+		t.Fatal(err)
+	}
+	p.SendBuffers([][]byte{{0}})
+
+	roamFrom(t, p, testStaticEP)
+	p.SendBuffers([][]byte{{0}})
+	if got, want := peerEndpoint(p), currentHopEndpoint(p); got != want {
+		t.Fatalf("endpoint after packet from old port + send = %s, want %s", got, want)
+	}
+}
+
+// A packet from a new host is followed, but only on the slot's port, and the
+// port it came from is never stored as the endpoint.
+func TestPortHopRoamingNewHostIsHopped(t *testing.T) {
+	p := newRealBindPortHopPeer(t)
+	p.SendBuffers([][]byte{{0}})
+	before := peerEndpoint(p)
+
+	roamFrom(t, p, "127.0.0.2:51820")
+	if got := peerEndpoint(p); got != before {
+		t.Fatalf("endpoint before next send = %s, want unchanged %s", got, before)
+	}
+	p.SendBuffers([][]byte{{0}})
+	if got, want := peerEndpoint(p), fmt.Sprintf("127.0.0.2:%d", currentHopPort(p)); got != want {
+		t.Fatalf("endpoint after roaming + send = %s, want %s", got, want)
+	}
+}
+
+// A packet from a new host already on the slot's port is taken as is.
+func TestPortHopRoamingOnHopPortTakesEndpoint(t *testing.T) {
+	p := newRealBindPortHopPeer(t)
+	p.SendBuffers([][]byte{{0}})
+
+	ep := roamFrom(t, p, fmt.Sprintf("127.0.0.2:%d", currentHopPort(p)))
+	p.SendBuffers([][]byte{{0}})
+	p.endpoint.Lock()
+	got := p.endpoint.val
+	p.endpoint.Unlock()
+	if got != ep {
+		t.Fatalf("endpoint after roaming on hop port = %s, want the packet's endpoint %s", got.DstToString(), ep.DstToString())
+	}
+}
+
+// An endpoint set over UAPI wins over an address roamed before it.
+func TestPortHopUAPIEndpointDropsRoamed(t *testing.T) {
+	p := newRealBindPortHopPeer(t)
+	p.SendBuffers([][]byte{{0}})
+
+	roamFrom(t, p, "127.0.0.2:51820")
+	pk := hex.EncodeToString(p.handshake.remoteStatic[:])
+	if err := p.device.IpcSet(uapiCfg("public_key", pk, "endpoint", "127.0.0.3:51820")); err != nil {
+		t.Fatal(err)
+	}
+	p.SendBuffers([][]byte{{0}})
+	if got, want := peerEndpoint(p), fmt.Sprintf("127.0.0.3:%d", currentHopPort(p)); got != want {
+		t.Fatalf("endpoint after UAPI set + send = %s, want %s", got, want)
 	}
 }
 

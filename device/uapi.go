@@ -635,6 +635,7 @@ func (device *Device) handlePeerLine(
 		peer.endpoint.Lock()
 		defer peer.endpoint.Unlock()
 		peer.endpoint.val = endpoint
+		peer.endpoint.roamed = nil // a configured endpoint wins over one roamed before it
 		peer.endpoint.hostname = hostname
 		peer.hopDone.Store(nil) // re-check the port hopping slot on the next send
 

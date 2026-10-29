@@ -33,8 +33,9 @@ type Peer struct {
 	endpoint          struct {
 		sync.Mutex
 		val            conn.Endpoint
-		hostname       string // original host:port if set via hostname, empty for static IPs
-		clearSrcOnTx   bool   // signal to val.ClearSrc() prior to next packet transmission
+		roamed         conn.Endpoint // new address seen while port hopping, applied by the next hop
+		hostname       string        // original host:port if set via hostname, empty for static IPs
+		clearSrcOnTx   bool          // signal to val.ClearSrc() prior to next packet transmission
 		disableRoaming bool
 	}
 
@@ -290,12 +291,6 @@ func (peer *Peer) Start() {
 	go peer.RoutineSequentialSender(batchSize)
 	go peer.RoutineSequentialReceiver(batchSize)
 
-	if device.portHopping.Load().enabled() {
-		peer.endpoint.Lock()
-		peer.endpoint.disableRoaming = true
-		peer.endpoint.Unlock()
-	}
-
 	peer.timersStart()
 
 	peer.isRunning.Store(true)
@@ -303,8 +298,9 @@ func (peer *Peer) Start() {
 
 // hopToCurrentSlot points the peer endpoint at the port for the current time
 // slot. It runs before every send, but only does work when the config or slot
-// changed since the endpoint was last moved, or when force is set (before each
-// handshake initiation, as a final check).
+// changed since the endpoint was last moved, when a packet came from a new
+// address, or when force is set (before each handshake initiation, as a final
+// check).
 func (peer *Peer) hopToCurrentSlot(force bool) {
 	cfg := peer.device.portHopping.Load()
 	if !cfg.enabled() {
@@ -337,7 +333,14 @@ func (peer *Peer) hopPort(cfg *portHopConfig, slot uint64) {
 	peer.endpoint.Lock()
 	defer peer.endpoint.Unlock()
 
-	if ep := peer.endpoint.val; ep != nil {
+	// A roamed address replaces the current one only once it is on the
+	// slot's port. If that fails, the current endpoint is kept.
+	ep, roamed := peer.endpoint.val, peer.endpoint.roamed
+	peer.endpoint.roamed = nil
+	if roamed != nil {
+		ep = roamed
+	}
+	if ep != nil {
 		hopped, changed, err := peer.hopEndpoint(device.net.bind, ep, cfg, slot)
 		switch {
 		case err != nil:
@@ -346,6 +349,10 @@ func (peer *Peer) hopPort(cfg *portHopConfig, slot uint64) {
 			peer.endpoint.val = hopped
 			peer.endpoint.clearSrcOnTx = true
 			device.log.Verbosef("%v - Port hop to %s", peer, hopped.DstToString())
+		case roamed != nil:
+			// Already on the slot's port: take it as plain roaming would.
+			peer.endpoint.val = roamed
+			peer.endpoint.clearSrcOnTx = false
 		}
 	}
 
@@ -445,6 +452,19 @@ func (peer *Peer) SetEndpointFromPacket(endpoint conn.Endpoint) {
 	if peer.endpoint.disableRoaming {
 		return
 	}
+	if peer.device.portHopping.Load().enabled() {
+		// The port comes from the hop schedule, so only a new address is
+		// taken from the packet. It is held back until the next send hops it
+		// onto the slot's port, so it is never sent to on the port it came from.
+		if cur := peer.endpoint.val; cur != nil && cur.DstIP() == endpoint.DstIP() {
+			peer.endpoint.roamed = nil
+			return
+		}
+		peer.endpoint.roamed = endpoint
+		peer.hopDone.Store(nil)
+		return
+	}
+	peer.endpoint.roamed = nil
 	peer.endpoint.clearSrcOnTx = false
 	peer.endpoint.val = endpoint
 }
